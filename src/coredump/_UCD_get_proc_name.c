@@ -68,3 +68,9 @@ _UCD_get_proc_name (unw_addr_space_t as, unw_word_t ip,
   return -UNW_ENOINFO;
 #endif
 }
+
+const char *_UCD_get_proc_backing_file(struct UCD_info *ui, unw_word_t ip)
+{
+  coredump_phdr_t *cphdr = _UCD_get_elf_image(ui, ip);
+  return cphdr ? cphdr->backing_filename : NULL;
+}

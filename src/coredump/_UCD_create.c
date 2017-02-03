@@ -25,6 +25,8 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.  */
 # include "config.h"
 #endif
 
+#include <stdlib.h>
+#include <errno.h>
 /* Endian detection */
 #include <limits.h>
 #if defined(HAVE_BYTESWAP_H)
@@ -72,8 +74,43 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.  */
 #define NOTE_FITS_IN(_hdr, _size) ((_size) >= sizeof (Elf32_Nhdr) && (_size) >= NOTE_SIZE (_hdr))
 #define NOTE_FITS(_hdr, _end) NOTE_FITS_IN((_hdr), (unsigned long)((char *)(_end) - (char *)(_hdr)))
 
+struct cmp_param_s {
+	struct UCD_info *ui;
+	unw_addr_space_t as;
+};
+
+static int _UCD_cmp_sp(const void *a, const void *b, void *param)
+{
+	struct cmp_param_s *cmp_param = param;
+	unw_word_t a_sp, b_sp;
+
+	cmp_param->ui->prstatus = *(void **)a;
+	_UCD_access_reg(cmp_param->as, UNW_REG_SP, &a_sp, 0, cmp_param->ui);
+
+	cmp_param->ui->prstatus = *(void **)b;
+	_UCD_access_reg(cmp_param->as, UNW_REG_SP, &b_sp, 0, cmp_param->ui);
+
+	if (a_sp < b_sp) return -1;
+	else if (a_sp > b_sp) return 1;
+	return 0;
+}
+
 struct UCD_info *
 _UCD_create(const char *filename)
+{
+	int new_fd = open(filename, O_RDONLY);
+	struct UCD_info *ui;
+
+	if (new_fd < 0) return NULL;
+
+	ui = _UCD_create_fd(new_fd, filename, 0);
+	close(new_fd);
+
+	return ui;
+}
+
+struct UCD_info *
+_UCD_create_fd(int fd, const char *name, size_t bufsize)
 {
   union
     {
@@ -91,36 +128,32 @@ _UCD_create(const char *filename)
   ui->edi.ktab.format = -1;
 #endif
 
-  int fd = ui->coredump_fd = open(filename, O_RDONLY);
-  if (fd < 0)
+  if (core_reader_open(&ui->reader, fd, bufsize))
     goto err;
-  ui->coredump_filename = strdup(filename);
+  ui->coredump_filename = strdup(name);
 
-  /* No sane ELF32 file is going to be smaller then ELF64 _header_,
-   * so let's just read 64-bit sized one.
-   */
-  if (read(fd, &elf_header64, sizeof(elf_header64)) != sizeof(elf_header64))
+  if (core_reader_pread(&ui->reader, &elf_header32, sizeof elf_header32, 0) != sizeof elf_header32)
     {
-      Debug(0, "'%s' is not an ELF file\n", filename);
+      Debug(0, "'%s' is not an ELF file: %d\n", name, errno);
       goto err;
     }
 
   if (memcmp(&elf_header32, ELFMAG, SELFMAG) != 0)
     {
-      Debug(0, "'%s' is not an ELF file\n", filename);
+      Debug(0, "'%s' is not an ELF file, wrong magic\n", name);
       goto err;
     }
 
   if (elf_header32.e_ident[EI_CLASS] != ELFCLASS32
    && elf_header32.e_ident[EI_CLASS] != ELFCLASS64)
     {
-      Debug(0, "'%s' is not a 32/64 bit ELF file\n", filename);
+      Debug(0, "'%s' is not a 32/64 bit ELF file\n", name);
       goto err;
     }
 
   if (WE_ARE_LITTLE_ENDIAN != (elf_header32.e_ident[EI_DATA] == ELFDATA2LSB))
     {
-      Debug(0, "'%s' is endian-incompatible\n", filename);
+      Debug(0, "'%s' is endian-incompatible\n", name);
       goto err;
     }
 
@@ -129,7 +162,7 @@ _UCD_create(const char *filename)
     {
       Debug(0, "Can't process '%s': 64-bit file "
                "while only %ld bits are supported",
-            filename, 8L * sizeof(off_t));
+            name, 8L * sizeof(off_t));
       goto err;
     }
 
@@ -139,28 +172,35 @@ _UCD_create(const char *filename)
             : (elf_header32.e_ehsize != 52 || elf_header32.e_phentsize != 32)
   )
     {
-      Debug(0, "'%s' has wrong e_ehsize or e_phentsize\n", filename);
+      Debug(0, "'%s' has wrong e_ehsize or e_phentsize\n", name);
       goto err;
     }
 
-  off_t ofs = (_64bits ? elf_header64.e_phoff : elf_header32.e_phoff);
-  if (lseek(fd, ofs, SEEK_SET) != ofs)
-    {
-      Debug(0, "Can't read phdrs from '%s'\n", filename);
-      goto err;
-    }
-  unsigned size = ui->phdrs_count = (_64bits ? elf_header64.e_phnum : elf_header32.e_phnum);
-  coredump_phdr_t *phdrs = ui->phdrs = memset(malloc(size * sizeof(phdrs[0])), 0, size * sizeof(phdrs[0]));
   if (_64bits)
     {
-      coredump_phdr_t *cur = phdrs;
-      unsigned i = 0;
-      while (i < size)
+      /* Read rest of the header */
+      unsigned size = sizeof elf_header64 - sizeof elf_header32;
+      if (size != core_reader_pread(&ui->reader, &elf_header32 + 1, size, sizeof elf_header32))
+        {
+          Debug(0, "Can't read rest of the header from '%s': %d\n", name, errno);
+          goto err;
+        }
+    }
+
+  unsigned size = ui->phdrs_count = (_64bits ? elf_header64.e_phnum : elf_header32.e_phnum);
+  coredump_phdr_t *phdrs = ui->phdrs = calloc(size, sizeof phdrs[0]);
+  if (_64bits)
+    {
+      coredump_phdr_t *cur;
+      unsigned i;
+
+      for (i = 0, cur = phdrs; i < size; i++, cur++)
         {
           Elf64_Phdr hdr64;
-          if (read(fd, &hdr64, sizeof(hdr64)) != sizeof(hdr64))
+          if (core_reader_pread(&ui->reader, &hdr64, sizeof hdr64,
+              elf_header64.e_phoff + i * sizeof hdr64) != sizeof hdr64)
             {
-              Debug(0, "Can't read phdrs from '%s'\n", filename);
+              Debug(0, "Can't read phdrs from '%s'\n", name);
               goto err;
             }
           cur->p_type   = hdr64.p_type  ;
@@ -175,18 +215,18 @@ _UCD_create(const char *filename)
           /* cur->backing_filename = NULL; - done by memset */
           cur->backing_fd = -1;
           cur->backing_filesize = hdr64.p_filesz;
-          i++;
-          cur++;
         }
     } else {
-      coredump_phdr_t *cur = phdrs;
-      unsigned i = 0;
-      while (i < size)
+      coredump_phdr_t *cur;
+      unsigned i;
+
+      for (i = 0, cur = phdrs; i < size; i++, cur++)
         {
           Elf32_Phdr hdr32;
-          if (read(fd, &hdr32, sizeof(hdr32)) != sizeof(hdr32))
+          if (core_reader_pread(&ui->reader, &hdr32, sizeof hdr32,
+              elf_header32.e_phoff + i * sizeof hdr32) != sizeof hdr32)
             {
-              Debug(0, "Can't read phdrs from '%s'\n", filename);
+              Debug(0, "Can't read phdrs from '%s': %d\n", name, errno);
               goto err;
             }
           cur->p_type   = hdr32.p_type  ;
@@ -200,8 +240,6 @@ _UCD_create(const char *filename)
           /* cur->backing_filename = NULL; - done by memset */
           cur->backing_fd = -1;
           cur->backing_filesize = hdr32.p_memsz;
-          i++;
-          cur++;
         }
     }
 
@@ -215,11 +253,12 @@ _UCD_create(const char *filename)
             Elf32_Nhdr *note_hdr, *note_end;
             unsigned n_threads;
 
+            Debug(0, "Read PT_NOTE\n");
+
             ui->note_phdr = malloc(cur->p_filesz);
-            if (lseek(fd, cur->p_offset, SEEK_SET) != (off_t)cur->p_offset
-             || (uoff_t)read(fd, ui->note_phdr, cur->p_filesz) != cur->p_filesz)
+            if (core_reader_pread(&ui->reader, ui->note_phdr, cur->p_filesz, cur->p_offset) != cur->p_filesz)
               {
-                    Debug(0, "Can't read PT_NOTE from '%s'\n", filename);
+                    Debug(0, "Can't read PT_NOTE from '%s'\n", name);
                     goto err;
               }
 
@@ -230,8 +269,12 @@ _UCD_create(const char *filename)
             note_hdr = (Elf32_Nhdr *)ui->note_phdr;
             while (NOTE_FITS (note_hdr, note_end))
               {
+                Debug(0, "Read in PT_NOTE\n");
                 if (note_hdr->n_type == NT_PRSTATUS)
-                  n_threads++;
+                  {
+                    n_threads++;
+                    Debug(0, "Read in PT_NOTE++\n");
+                  }
 
                 note_hdr = NOTE_NEXT (note_hdr);
               }
@@ -249,7 +292,7 @@ _UCD_create(const char *filename)
                 note_hdr = NOTE_NEXT (note_hdr);
               }
           }
-        if (cur->p_type == PT_LOAD)
+	else if (cur->p_type == PT_LOAD)
           {
             Debug(2, " ofs:%08llx va:%08llx filesize:%08llx memsize:%08llx flg:%x",
                                 (unsigned long long) cur->p_offset,
@@ -263,6 +306,10 @@ _UCD_create(const char *filename)
             if (cur->p_flags & PF_X)
               Debug(2, " executable");
           }
+	else
+          {
+            Debug(2, " Unknown");
+          }
         Debug(2, "\n");
         i++;
         cur++;
@@ -270,10 +317,13 @@ _UCD_create(const char *filename)
 
     if (ui->n_threads == 0)
       {
-        Debug(0, "No NT_PRSTATUS note found in '%s'\n", filename);
+        Debug(0, "No NT_PRSTATUS note found in '%s'\n", name);
         goto err;
       }
 
+    /* Sort by a stack pointer */
+    struct cmp_param_s param = { .ui = ui, .as = NULL }; // as is not used
+    qsort_r(ui->threads, ui->n_threads, sizeof ui->threads[0], _UCD_cmp_sp, &param);
     ui->prstatus = ui->threads[0];
 
   return ui;
@@ -302,6 +352,16 @@ pid_t _UCD_get_pid(struct UCD_info *ui)
 int _UCD_get_cursig(struct UCD_info *ui)
 {
   return ui->prstatus->pr_cursig;
+}
+
+const struct timeval *_UCD_get_utime(struct UCD_info *ui)
+{
+  return &ui->prstatus->pr_utime;
+}
+
+const struct timeval *_UCD_get_stime(struct UCD_info *ui)
+{
+  return &ui->prstatus->pr_stime;
 }
 
 int _UCD_add_backing_file_at_segment(struct UCD_info *ui, int phdr_no, const char *filename)
@@ -356,9 +416,7 @@ int _UCD_add_backing_file_at_segment(struct UCD_info *ui, int phdr_no, const cha
 //TODO: loop and compare in smaller blocks
       char *core_buf = malloc(phdr->p_filesz);
       char *file_buf = malloc(phdr->p_filesz);
-      if (lseek(ui->coredump_fd, phdr->p_offset, SEEK_SET) != (off_t)phdr->p_offset
-       || (uoff_t)read(ui->coredump_fd, core_buf, phdr->p_filesz) != phdr->p_filesz
-      )
+      if (core_reader_pread(&ui->reader, core_buf, phdr->p_filesz, phdr->p_offset) != phdr->p_filesz)
         {
           Debug(0, "Error reading from coredump file\n");
  err_read:
@@ -408,6 +466,7 @@ int _UCD_add_backing_file_at_vaddr(struct UCD_info *ui,
   for (i = 0; i < ui->phdrs_count; i++)
     {
       struct coredump_phdr *phdr = &ui->phdrs[i];
+      Debug(0, "CMP %lx %lx\n", phdr->p_vaddr, vaddr);
       if (phdr->p_vaddr != vaddr)
         continue;
       /* It seems to match. Add it. */

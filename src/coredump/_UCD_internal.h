@@ -68,7 +68,7 @@ struct coredump_phdr
     uoff_t   p_align;
     /* Data for backing file. If backing_fd < 0, there is no file */
     uoff_t   backing_filesize;
-    char    *backing_filename; /* for error meesages only */
+    char    *backing_filename;
     int      backing_fd;
   };
 
@@ -82,10 +82,27 @@ typedef struct coredump_phdr coredump_phdr_t;
 #define PRSTATUS_STRUCT non_existent
 #endif
 
+struct core_reader_s;
+
+struct core_reader_s {
+	/** Underlying file descriptor */
+	int fd;
+	/** Offset of buffered data */
+	off_t off;
+	/** Pointer to the oldest data (0 = empty, buf_size = buf start) */
+	size_t buf_ptr;
+	/** Data buffer size */
+	size_t buf_size;
+	/** Data buffer */
+	char *buf;
+	/** Read routine */
+	ssize_t (*pread)(struct core_reader_s *, void *buf, size_t count, off_t offset);
+};
+
 struct UCD_info
   {
     int big_endian;  /* bool */
-    int coredump_fd;
+    struct core_reader_s reader;
     char *coredump_filename; /* for error meesages only */
     coredump_phdr_t *phdrs; /* array, allocated */
     unsigned phdrs_count;
@@ -101,5 +118,11 @@ extern coredump_phdr_t * _UCD_get_elf_image(struct UCD_info *ui, unw_word_t ip);
 
 #define STRUCT_MEMBER_P(struct_p, struct_offset) ((void *) ((char*) (struct_p) + (long) (struct_offset)))
 #define STRUCT_MEMBER(member_type, struct_p, struct_offset) (*(member_type*) STRUCT_MEMBER_P ((struct_p), (struct_offset)))
+
+int core_reader_open(struct core_reader_s *reader, int fd, size_t bufsize);
+
+ssize_t core_reader_pread(struct core_reader_s *reader, void *buf, size_t count, off_t offset);
+
+int core_reader_close(struct core_reader_s *reader);
 
 #endif

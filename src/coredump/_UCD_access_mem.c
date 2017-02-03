@@ -69,18 +69,16 @@ _UCD_access_mem(unw_addr_space_t as, unw_word_t addr, unw_word_t *val,
       filename = phdr->backing_filename;
       fileofs = addr - phdr->p_vaddr;
       fd = phdr->backing_fd;
-      goto read;
+      if (lseek(fd, fileofs, SEEK_SET) != fileofs)
+        goto read_error;
+      if (read(fd, val, sizeof(*val)) != sizeof(*val))
+        goto read_error;
+    } else {
+      filename = ui->coredump_filename;
+      fileofs = phdr->p_offset + (addr - phdr->p_vaddr);
+      if (core_reader_pread(&ui->reader, val, sizeof *val, fileofs) != sizeof *val)
+        goto read_error;
     }
-
-  filename = ui->coredump_filename;
-  fileofs = phdr->p_offset + (addr - phdr->p_vaddr);
-  fd = ui->coredump_fd;
- read:
-  if (lseek(fd, fileofs, SEEK_SET) != fileofs)
-    goto read_error;
-  if (read(fd, val, sizeof(*val)) != sizeof(*val))
-    goto read_error;
-
   Debug(1, "0x%llx <- [addr:0x%llx fileofs:0x%llx]\n",
         (unsigned long long)(*val),
         (unsigned long long)addr,

@@ -29,8 +29,7 @@ _UCD_destroy (struct UCD_info *ui)
   if (!ui)
     return;
 
-  if (ui->coredump_fd >= 0)
-    close(ui->coredump_fd);
+  core_reader_close(&ui->reader);
   free(ui->coredump_filename);
 
   invalidate_edi (&ui->edi);
