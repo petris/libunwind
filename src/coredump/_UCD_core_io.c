@@ -92,9 +92,16 @@ static int core_reader_init(struct core_reader_s *reader, int fd, size_t bufsize
 
 int core_reader_open(struct core_reader_s *reader, int fd, size_t bufsize)
 {
-	int new_fd = dup(fd);
-
+#ifdef F_DUPFD_CLOEXEC
+	int new_fd = fcntl(fd, F_DUPFD_CLOEXEC, 0);
 	if (new_fd < 0) return -1;
+#else
+	int new_fd = dup(fd);
+	if (new_fd < 0) return -1;
+
+	fcntl(newfd, F_SETFD, fcntl(new_fd, F_GETFD, 0) | FD_CLOEXEC);
+#endif
+
 	if (core_reader_init(reader, new_fd, bufsize)) {
 		close(new_fd);
 		return -1;
